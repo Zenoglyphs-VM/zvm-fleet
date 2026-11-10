@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -48,11 +49,12 @@ type userReportReadMember struct {
 	name, role string
 	info       os.FileInfo
 	raw        []byte
+	digest     userReportDigest
 }
 
 type userReportOpen func(*os.Root, string) (*os.File, error)
 
-func (m *userReportReadMember) capture(limit int64, open userReportOpen) (result error) {
+func (m *userReportReadMember) capture(limit int64, retain bool, open userReportOpen) (result error) {
 	if err := m.dir.check(); err != nil {
 		return err
 	}
@@ -72,17 +74,35 @@ func (m *userReportReadMember) capture(limit int64, open userReportOpen) (result
 	if err != nil || !sameReportFile(before, opened) {
 		return errors.New("user report member changed before reading")
 	}
-	raw, err := io.ReadAll(io.LimitReader(f, before.Size()+1))
+	var raw []byte
+	var count int64
+	var digest userReportDigest
+	if retain {
+		// One allocation also reserves the byte that detects unexpected growth.
+		buf := make([]byte, before.Size()+1)
+		var n int
+		n, err = io.ReadFull(f, buf)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			err = nil
+		}
+		count = int64(n)
+		raw = buf[:n:n]
+		digest = reportDigest(raw)
+	} else {
+		hash := sha256.New()
+		count, err = io.Copy(hash, io.LimitReader(f, before.Size()+1))
+		digest = userReportDigest{hex.EncodeToString(hash.Sum(nil)), count}
+	}
 	after, statErr := f.Stat()
 	current, pathErr := m.dir.root.Lstat(m.name)
-	if err != nil || statErr != nil || pathErr != nil || int64(len(raw)) != before.Size() ||
+	if err != nil || statErr != nil || pathErr != nil || count != before.Size() ||
 		!sameReportFile(before, after) || !sameReportFile(before, current) {
 		return errors.Join(err, statErr, pathErr, errors.New("user report member changed while reading"))
 	}
 	if err := m.dir.check(); err != nil {
 		return err
 	}
-	m.info, m.raw = before, raw
+	m.info, m.raw, m.digest = before, raw, digest
 	return nil
 }
 
@@ -90,39 +110,37 @@ func (m *userReportReadMember) capture(limit int64, open userReportOpen) (result
 // This does not authenticate a writer, establish source freshness or make stdout
 // transactional; a consumer must still check the command's exit status.
 type checkedUserReport struct {
-	generation        string
-	markdown, summary []byte
+	generation string
+	member     string
+	raw        []byte
 }
 
 func (r *checkedUserReport) write(w io.Writer, member string) error {
 	if r == nil || w == nil {
 		return errors.New("checked user report output is unavailable")
 	}
-	var raw []byte
-	switch member {
-	case "markdown":
-		raw = r.markdown
-	case "summary":
-		raw = r.summary
-	default:
-		return errors.New("-read must select markdown or summary")
+	if member != r.member {
+		return errors.New("requested user report member was not captured")
 	}
-	n, err := w.Write(raw)
-	if n != len(raw) {
+	n, err := w.Write(r.raw)
+	if n != len(r.raw) {
 		err = errors.Join(err, io.ErrShortWrite)
 	}
 	return err
 }
 
-func readUsersReport(in, out string) (*checkedUserReport, error) {
-	return readUsersReportWith(in, out, userReportReadLimits{userReportReadMarkdownLimit, userReportReadSummaryLimit}, openUserReportConsumerFile)
+func readUsersReport(in, out, member string) (*checkedUserReport, error) {
+	return readUsersReportWith(in, out, member, userReportReadLimits{userReportReadMarkdownLimit, userReportReadSummaryLimit}, openUserReportConsumerFile)
 }
 
 // A per-call opener permits deterministic file/claim changes in the owned
 // filesystem controls without mutating global functions or other readers.
-func readUsersReportWith(in, out string, limits userReportReadLimits, open userReportOpen) (snapshot *checkedUserReport, result error) {
+func readUsersReportWith(in, out, selectedMember string, limits userReportReadLimits, open userReportOpen) (snapshot *checkedUserReport, result error) {
 	if limits.markdown < 0 || limits.markdown > userReportReadMarkdownLimit || limits.summary < 0 || limits.summary > userReportReadSummaryLimit || open == nil {
 		return nil, errors.New("invalid user report read limits or opener")
+	}
+	if selectedMember != "markdown" && selectedMember != "summary" {
+		return nil, errors.New("-read must select markdown or summary")
 	}
 	abs, err := filepath.Abs(out)
 	if err != nil {
@@ -160,7 +178,7 @@ func readUsersReportWith(in, out string, limits userReportReadLimits, open userR
 		return nil, err
 	}
 	receipt := &userReportReadMember{dir: d, name: userReportReceiptName, role: "receipt"}
-	if err := receipt.capture(userReportReadReceiptLimit, open); err != nil {
+	if err := receipt.capture(userReportReadReceiptLimit, true, open); err != nil {
 		return nil, err
 	}
 	selected, err := decodeUserReportReceipt(receipt.raw)
@@ -181,11 +199,11 @@ func readUsersReportWith(in, out string, limits userReportReadLimits, open userR
 		if member == markdown {
 			limit = limits.markdown
 		}
-		if err := member.capture(limit, open); err != nil {
+		if err := member.capture(limit, member.role == selectedMember, open); err != nil {
 			return nil, err
 		}
 	}
-	if reportDigest(markdown.raw) != selected.Markdown || reportDigest(summary.raw) != selected.Summary {
+	if markdown.digest != selected.Markdown || summary.digest != selected.Summary {
 		return nil, errors.New("user report captured pair does not match its receipt")
 	}
 	for i, member := range members {
@@ -205,5 +223,9 @@ func readUsersReportWith(in, out string, limits userReportReadLimits, open userR
 	if err := noClaim(); err != nil {
 		return nil, err
 	}
-	return &checkedUserReport{selected.Generation, markdown.raw, summary.raw}, nil
+	raw := markdown.raw
+	if selectedMember == "summary" {
+		raw = summary.raw
+	}
+	return &checkedUserReport{selected.Generation, selectedMember, raw}, nil
 }

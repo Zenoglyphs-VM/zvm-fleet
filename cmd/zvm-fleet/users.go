@@ -203,7 +203,7 @@ func benchUsersReportTo(args []string, stdout io.Writer) error {
 		if (*read != "markdown" && *read != "summary") || fs.NArg() != 0 {
 			return errors.New("-read must select markdown or summary without positional arguments")
 		}
-		report, err := readUsersReport(*in, *out)
+		report, err := readUsersReport(*in, *out, *read)
 		if err != nil {
 			return err
 		}

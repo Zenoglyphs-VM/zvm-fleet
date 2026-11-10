@@ -25,7 +25,7 @@ func TestUserReportConsumerFIFOReplacementDoesNotWait(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		got, err := readUsersReportWith(dir, out, userReportReadLimits{1024, 1024}, open)
+		got, err := readUsersReportWith(dir, out, "markdown", userReportReadLimits{1024, 1024}, open)
 		if got != nil {
 			done <- nil
 			return

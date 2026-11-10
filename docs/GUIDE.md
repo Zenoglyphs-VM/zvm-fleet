@@ -686,9 +686,10 @@ or extra argument cannot fall through to rebuilding. Existing `-verify` remains
 a verification-only command; its acknowledgement is not a snapshot for a later
 independent path read.
 
-The reader retains at most 16 MiB Markdown, 32 MiB summary and 4096 receipt
-bytes, rejecting larger declared or actual members. These are payload limits,
-not a fixed process-heap or kernel-I/O deadline. Unix opens are nonblocking so a
+The reader retains the selected member and the canonical receipt. It verifies
+the other member's SHA-256 while streaming its bytes. Both members retain their
+read limits of 16 MiB for Markdown and 32 MiB for summary. The receipt limit is
+4096 bytes. These limits apply to payload sizes. Unix opens are nonblocking so a
 FIFO substituted before open is refused without waiting for a writer. The new
 consumption mode refuses unsupported non-Unix platforms; existing generation
 and verification remain available there. Native platform qualification is

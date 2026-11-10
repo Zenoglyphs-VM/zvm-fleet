@@ -59,13 +59,14 @@ func TestUserReportConsumerReadsPublishedBytes(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			got, err := readUsersReport(dir, out)
-			if err != nil || got == nil || len(got.generation) != 32 || !bytes.Equal(got.markdown, markdown) || !bytes.Equal(got.summary, summary) {
-				t.Fatal("consumer did not capture the exact published generation", err)
-			}
 			member, want := "markdown", markdown
 			if kind == "summary" {
 				member, want = "summary", summary
+			}
+			got, err := readUsersReport(dir, out, member)
+			if err != nil || got == nil || len(got.generation) != 32 || got.member != member ||
+				!bytes.Equal(got.raw, want) || cap(got.raw) != len(want) {
+				t.Fatal("consumer did not retain only the exact selected bytes", err)
 			}
 			var output bytes.Buffer
 			if err := got.write(&output, member); err != nil || !bytes.Equal(output.Bytes(), want) {
@@ -89,9 +90,9 @@ func TestUserReportConsumerRefusesInvalidPublishedPairs(t *testing.T) {
 			case "missing-markdown":
 				err = os.Rename(out, filepath.Join(dir, "retained-markdown"))
 			case "changed-markdown":
-				err = os.WriteFile(out, []byte("different Markdown\n"), 0o600)
+				err = os.WriteFile(out, []byte("other Markdown\n"), 0o600)
 			case "changed-summary":
-				err = os.WriteFile(filepath.Join(dir, "summary.json"), []byte("{\"different\":true}\n"), 0o600)
+				err = os.WriteFile(filepath.Join(dir, "summary.json"), []byte("{\"other\":true}\n"), 0o600)
 			case "receipt-state":
 				consumerChange(t, dir, func(r *userReportReceipt) { r.State = "pending" })
 			case "receipt-generation":
@@ -110,7 +111,12 @@ func TestUserReportConsumerRefusesInvalidPublishedPairs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got, err := readUsersReport(dir, out); err == nil || got != nil {
+			// Corrupt an unselected member without changing its byte count.
+			member := "markdown"
+			if kind == "changed-markdown" {
+				member = "summary"
+			}
+			if got, err := readUsersReport(dir, out, member); err == nil || got != nil {
 				t.Fatal("consumer accepted invalid or uncommitted report bytes")
 			}
 		})
@@ -138,13 +144,15 @@ func TestUserReportConsumerByteBudgets(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got, err := readUsersReportWith(dir, out, limits, openUserReportConsumerFile)
-			if kind == "exact" {
-				if err != nil || got == nil || string(got.markdown) != "12345" || string(got.summary) != "123456" {
-					t.Fatal("exact read boundary failed", err)
+			for _, selection := range []struct{ member, want string }{{"markdown", "12345"}, {"summary", "123456"}} {
+				got, err := readUsersReportWith(dir, out, selection.member, limits, openUserReportConsumerFile)
+				if kind == "exact" {
+					if err != nil || got == nil || string(got.raw) != selection.want {
+						t.Fatal("exact read boundary failed", err)
+					}
+				} else if err == nil || got != nil {
+					t.Fatal("consumer accepted an exceeded read budget")
 				}
-			} else if err == nil || got != nil {
-				t.Fatal("consumer accepted an exceeded read budget")
 			}
 		})
 	}
@@ -198,7 +206,7 @@ func TestUserReportConsumerRejectsNameAndFileChanges(t *testing.T) {
 					return openUserReportConsumerFile(root, name)
 				}
 			}
-			got, err := readUsersReportWith(dir, out, userReportReadLimits{1024, 1024}, open)
+			got, err := readUsersReportWith(dir, out, "markdown", userReportReadLimits{1024, 1024}, open)
 			if err == nil || got != nil {
 				t.Fatal("consumer accepted a reserved, aliased or changed file/claim identity")
 			}
@@ -208,23 +216,31 @@ func TestUserReportConsumerRejectsNameAndFileChanges(t *testing.T) {
 
 func TestUserReportConsumerRetainsCapturedGeneration(t *testing.T) {
 	dir, out := consumerPair(t, []byte("first Markdown"), []byte("first summary"))
-	old, err := readUsersReport(dir, out)
-	if err != nil {
-		t.Fatal(err)
+	selections := []string{"markdown", "summary"}
+	old := make(map[string]*checkedUserReport, len(selections))
+	for _, member := range selections {
+		got, err := readUsersReport(dir, out, member)
+		if err != nil {
+			t.Fatal(err)
+		}
+		old[member] = got
+	}
+	if old["markdown"].generation != old["summary"].generation {
+		t.Fatal("fixture did not read one original generation")
 	}
 	if err := publishUsersReport(dir, out, []byte("second Markdown"), []byte("second summary")); err != nil {
 		t.Fatal(err)
 	}
-	latest, err := readUsersReport(dir, out)
+	latest, err := readUsersReport(dir, out, "markdown")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if old.generation == latest.generation {
+	if old["markdown"].generation == latest.generation {
 		t.Fatal("fixture did not publish a different generation")
 	}
-	for _, member := range []string{"markdown", "summary"} {
+	for _, member := range selections {
 		var output bytes.Buffer
-		if err := old.write(&output, member); err != nil {
+		if err := old[member].write(&output, member); err != nil {
 			t.Fatal(err)
 		}
 		if output.String() != "first "+map[string]string{"markdown": "Markdown", "summary": "summary"}[member] {
@@ -243,7 +259,7 @@ func (w *consumerWriter) Write(raw []byte) (int, error) { w.calls++; return w.n,
 
 func TestUserReportConsumerOutputErrors(t *testing.T) {
 	want := errors.New("owned output refused")
-	report := &checkedUserReport{summary: []byte("captured")}
+	report := &checkedUserReport{member: "summary", raw: []byte("captured")}
 	for _, kind := range []string{"short", "failed", "invalid-count", "invalid-member"} {
 		t.Run(kind, func(t *testing.T) {
 			writer := &consumerWriter{n: 8}
@@ -345,7 +361,7 @@ func TestUserReportConsumerRefusesCooperatingPublisher(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("owned publisher did not reach its claim")
 	}
-	if got, err := readUsersReport(dir, out); err == nil || got != nil {
+	if got, err := readUsersReport(dir, out, "markdown"); err == nil || got != nil {
 		t.Error("consumer accepted an active publisher")
 	}
 	close(release)
@@ -357,7 +373,7 @@ func TestUserReportConsumerRefusesCooperatingPublisher(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("owned publisher did not finish")
 	}
-	if got, err := readUsersReport(dir, out); err != nil || got == nil {
+	if got, err := readUsersReport(dir, out, "markdown"); err != nil || got == nil {
 		t.Fatal("finished publication remained unreadable", err)
 	}
 }
