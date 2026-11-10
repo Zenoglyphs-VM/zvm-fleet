@@ -1,7 +1,6 @@
 package fleet
 
 import (
-	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"encoding/json"
@@ -12,8 +11,6 @@ import (
 	"math/big"
 	"math/rand/v2"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -185,33 +182,40 @@ const (
 // order posted to the node. They are streamed to records.jsonl as they finish,
 // so a run that dies at hour five still has its first five hours.
 type Record struct {
-	T         int64  `json:"t"` // start, unix ms
-	User      int    `json:"user"`
-	Profile   string `json:"profile"`
-	Action    string `json:"action"`
-	Kind      string `json:"kind"` // tx, read, order, payout
-	OK        bool   `json:"ok"`
-	Hash      string `json:"hash,omitempty"`
-	Block     uint64 `json:"block,omitempty"`
-	GasUsed   uint64 `json:"gas,omitempty"`
-	Reverted  bool   `json:"reverted,omitempty"`
-	Skipped   string `json:"skipped,omitempty"`   // nothing to do, e.g. no listing to buy
-	ConfirmMS int64  `json:"confirmMs,omitempty"` // submit → receipt seen, what the user waits
-	IncludeMS int64  `json:"includeMs,omitempty"` // submit → the block's timestamp
-	LatencyMS int64  `json:"latencyMs,omitempty"` // reads and orders: the request
-	Bytes     int64  `json:"bytes,omitempty"`
-	Error     string `json:"error,omitempty"`
+	RunID             string `json:"runId,omitempty"`
+	T                 int64  `json:"t"` // start, unix ms
+	User              int    `json:"user"`
+	Profile           string `json:"profile"`
+	Action            string `json:"action"`
+	Kind              string `json:"kind"` // tx, read, order, payout
+	OK                bool   `json:"ok"`
+	Hash              string `json:"hash,omitempty"`
+	Block             uint64 `json:"block,omitempty"`
+	GasUsed           uint64 `json:"gas,omitempty"`
+	GasKnown          *bool  `json:"gasKnown,omitempty"`
+	Reverted          bool   `json:"reverted,omitempty"`
+	Skipped           string `json:"skipped,omitempty"`   // nothing to do, e.g. no listing to buy
+	ConfirmMS         int64  `json:"confirmMs,omitempty"` // submit → receipt seen, what the user waits
+	IncludeMS         int64  `json:"includeMs,omitempty"` // submit → the block's timestamp
+	LatencyMS         int64  `json:"latencyMs,omitempty"` // reads and orders: the request
+	ConfirmKnown      *bool  `json:"confirmKnown,omitempty"`
+	IncludeKnown      *bool  `json:"includeKnown,omitempty"`
+	LatencyKnown      *bool  `json:"latencyKnown,omitempty"`
+	TimestampBasis    string `json:"timestampBasis,omitempty"`
+	PayoutAnchorMS    int64  `json:"payoutAnchorMs,omitempty"`
+	PayoutAnchorKnown *bool  `json:"payoutAnchorKnown,omitempty"`
+	Bytes             int64  `json:"bytes,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 type sim struct {
-	e     *Env
-	o     UserOptions
-	out   *os.File
-	w     *bufio.Writer
-	mu    sync.Mutex
-	users []*user
-	start time.Time
-	end   time.Time
+	jsonlOutput
+	e         *Env
+	o         UserOptions
+	users     []*user
+	start     time.Time
+	end       time.Time
+	followCtx context.Context // survives the action deadline, but not run cancellation
 
 	pid       int
 	lp        common.Address
@@ -243,11 +247,20 @@ type user struct {
 }
 
 func (s *sim) emit(r *Record) {
-	raw, _ := json.Marshal(r)
-	s.mu.Lock()
-	s.w.Write(raw)
-	s.w.WriteByte('\n')
-	s.mu.Unlock()
+	if s.e != nil {
+		if id := s.e.userRunToken(); id != "" {
+			if r.RunID != "" && r.RunID != id {
+				s.mu.Lock()
+				s.failLocked("record run identifier", errors.New("identifier mismatch"))
+				s.mu.Unlock()
+				return
+			}
+			r.RunID = id
+		}
+	}
+	if err := s.append(r, false); err != nil {
+		return
+	}
 	if r.Kind == "tx" && r.Skipped == "" {
 		s.txs.Add(1)
 		if !r.OK {
@@ -273,23 +286,31 @@ func UsersPhase(o UserOptions) Phase {
 	}
 }
 
-func (e *Env) runUsers(ctx context.Context, p *PhaseRecord, o UserOptions) error {
-	f, err := os.Create(filepath.Join(e.Out, "records.jsonl"))
+func (e *Env) runUsers(ctx context.Context, p *PhaseRecord, o UserOptions) (result error) {
+	meta := map[string]any{"label": o.Label, "mix": o.Mix, "duration": o.Duration.String(), "ramp": o.Ramp.String(), "pace": o.Pace,
+		"chainId": e.Rollup.L2ChainID, "l1ChainId": e.Rollup.L1ChainID, "runId": e.userRunToken()}
+	raw, err := json.MarshalIndent(meta, "", " ")
+	if err != nil {
+		return fmt.Errorf("encoding user metadata: %w", err)
+	}
+	if err := e.checkUserRun(); err != nil {
+		return err
+	}
+	f, err := e.openUserOutput("records.jsonl")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	s := &sim{e: e, o: o, out: f, w: bufio.NewWriterSize(f, 1<<16)}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	s := &sim{e: e, o: o, jsonlOutput: newJSONLOutput(f, cancel), followCtx: ctx}
 	defer func() {
-		s.mu.Lock()
-		s.w.Flush()
-		s.mu.Unlock()
+		if err := s.finish(); err != nil && !errors.Is(result, err) {
+			result = errors.Join(result, err)
+		}
 	}()
-	meta := map[string]any{"label": o.Label, "mix": o.Mix, "duration": o.Duration.String(), "ramp": o.Ramp.String(), "pace": o.Pace,
-		"chainId": e.Rollup.L2ChainID, "l1ChainId": e.Rollup.L1ChainID}
 	p.set("users", meta)
-	if raw, err := json.MarshalIndent(meta, "", " "); err == nil {
-		os.WriteFile(filepath.Join(e.Out, "users.json"), raw, 0o644)
+	if err := e.writeUserOutput("users.json", raw); err != nil {
+		return fmt.Errorf("writing user metadata: %w", err)
 	}
 
 	prepStart := time.Now()
@@ -297,7 +318,12 @@ func (e *Env) runUsers(ctx context.Context, p *PhaseRecord, o UserOptions) error
 		return fmt.Errorf("preparing users: %w", err)
 	}
 	p.set("prepareSeconds", time.Since(prepStart).Seconds())
+	return s.runSimulation(ctx, p)
+}
 
+// runSimulation joins every producer before it closes the record stream.
+func (s *sim) runSimulation(ctx context.Context, p *PhaseRecord) error {
+	e, o := s.e, s.o
 	s.start = time.Now()
 	s.end = s.start.Add(o.Duration)
 	p.set("simStart", s.start.UTC())
@@ -326,10 +352,12 @@ func (e *Env) runUsers(ctx context.Context, p *PhaseRecord, o UserOptions) error
 	}
 	upkeep := make(chan struct{})
 	go func() { defer close(upkeep); s.upkeep(simCtx, p) }()
-	go s.progress(simCtx)
+	progress := make(chan struct{})
+	go func() { defer close(progress); s.progress(simCtx) }()
 
 	wg.Wait()
 	<-upkeep
+	<-progress
 	s.pending.Wait() // bounded by the receipt timeout
 	p.set("simEnd", time.Now().UTC())
 	// Withdrawals already initiated are followed to their payout, bounded:
@@ -337,20 +365,25 @@ func (e *Env) runUsers(ctx context.Context, p *PhaseRecord, o UserOptions) error
 	e.Log.Info("users done; following open withdrawals to their payout")
 	done := make(chan struct{})
 	go func() { s.wg.Wait(); close(done) }()
+	followTimer := time.NewTimer(30 * time.Minute)
+	defer followTimer.Stop()
 	select {
 	case <-done:
-	case <-time.After(30 * time.Minute):
+	case <-followTimer.C:
 		e.Log.Warn("withdrawals still unpaid 30 minutes after the run")
+		s.cancel(errors.New("withdrawal follow-up budget exhausted"))
+		<-done
 	case <-ctx.Done():
+		<-done
 	}
-	s.mu.Lock()
-	s.w.Flush()
-	s.mu.Unlock()
+	if err := s.finish(); err != nil {
+		return errors.Join(err, context.Cause(ctx))
+	}
 	sum, err := SummarizeUsers(e.Out)
 	if err == nil {
 		p.set("summary", sum.Totals)
 	}
-	return nil
+	return errors.Join(err, context.Cause(ctx))
 }
 
 func (s *sim) progress(ctx context.Context) {
@@ -362,9 +395,9 @@ func (s *sim) progress(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		s.mu.Lock()
-		s.w.Flush()
-		s.mu.Unlock()
+		if err := s.flush(); err != nil {
+			return
+		}
 		s.e.Log.Info("users progress", "elapsed", time.Since(s.start).Round(time.Minute),
 			"txs", s.txs.Load(), "failed", s.fails.Load())
 	}
@@ -765,7 +798,7 @@ func (u *user) send(ctx context.Context, rec *Record, req *txReq) {
 		rec.Error = err.Error()
 		u.s.emit(rec)
 		if u.key != nil && (strings.Contains(err.Error(), "nonce") || strings.Contains(err.Error(), "replacement")) {
-			u.resync(context.WithoutCancel(ctx))
+			u.resync(u.s.followContext(ctx))
 		}
 		return
 	}
@@ -777,9 +810,11 @@ func (u *user) send(ctx context.Context, rec *Record, req *txReq) {
 		}
 		// The receipt is waited for past the run's end: a transaction the user
 		// sent in its last minute is still part of what it saw.
-		wctx := context.WithoutCancel(ctx)
+		wctx := u.s.followContext(ctx)
 		r, err := u.receipt(wctx, tx.Hash(), 10*time.Minute)
 		rec.ConfirmMS = time.Since(submitted).Milliseconds()
+		known := err == nil
+		rec.ConfirmKnown = &known
 		if err != nil {
 			rec.Error = err.Error()
 			rec.ConfirmMS = 0
@@ -790,9 +825,14 @@ func (u *user) send(ctx context.Context, rec *Record, req *txReq) {
 			return
 		}
 		rec.Block, rec.GasUsed = r.BlockNumber.Uint64(), r.GasUsed
-		if bt, ok := u.s.blockTimeOf(wctx, r.BlockNumber); ok {
-			rec.IncludeMS = bt*1000 - submitted.UnixMilli()
+		gasKnown := true
+		rec.GasKnown = &gasKnown
+		bt, ok := u.s.blockTimeOf(wctx, r.BlockNumber)
+		blockMS, ok := userBlockMilliseconds(bt, ok)
+		if ok {
+			rec.IncludeMS, ok = userClockDifference(blockMS, submitted.UnixMilli())
 		}
+		rec.IncludeKnown = &ok
 		rec.Reverted = r.Status != types.ReceiptStatusSuccessful
 		rec.OK = !rec.Reverted
 		if rec.OK && req.after != nil {
@@ -824,11 +864,15 @@ func (u *user) receipt(ctx context.Context, h common.Hash, timeout time.Duration
 }
 
 func (s *sim) blockTimeOf(ctx context.Context, n *big.Int) (int64, bool) {
+	if n == nil || !n.IsUint64() {
+		return 0, false
+	}
 	if v, ok := s.blockTime.Load(n.Uint64()); ok {
-		return v.(int64), true
+		value := v.(int64)
+		return value, value >= 0
 	}
 	h, err := s.e.Eth.HeaderByNumber(ctx, n)
-	if err != nil {
+	if err != nil || h == nil || h.Time > math.MaxInt64 {
 		return 0, false
 	}
 	s.blockTime.Store(n.Uint64(), int64(h.Time))
@@ -937,7 +981,7 @@ func (u *user) minted(r *types.Receipt) {
 func (u *user) list(ctx context.Context, rec *Record) {
 	e := u.s.e
 	t0 := time.Now()
-	defer func() { rec.LatencyMS = time.Since(t0).Milliseconds() }()
+	defer func() { rec.LatencyMS = time.Since(t0).Milliseconds(); known := true; rec.LatencyKnown = &known }()
 	for {
 		u.ownedMu.Lock()
 		if len(u.owned) == 0 {
@@ -1037,8 +1081,15 @@ func (u *user) buy(ctx context.Context, rec *Record) (*txReq, error) {
 
 // followWithdrawal waits for the vault to pay a withdrawal out on NoM and
 // records how long the user waited for their ZNN.
+func (s *sim) followContext(fallback context.Context) context.Context {
+	if s.followCtx != nil {
+		return s.followCtx
+	}
+	return fallback
+}
+
 func (u *user) followWithdrawal(ctx context.Context, r *types.Receipt) {
-	ctx = context.WithoutCancel(ctx)
+	ctx = u.s.followContext(ctx)
 	var id uint64
 	for _, l := range r.Logs {
 		if l.Address == rollup.BridgeAddr && len(l.Topics) == 4 && l.Topics[0] == bridge.TopicWithdrawalInitiated {
@@ -1049,22 +1100,29 @@ func (u *user) followWithdrawal(ctx context.Context, r *types.Receipt) {
 		return
 	}
 	s := u.s
-	bt, _ := s.blockTimeOf(ctx, r.BlockNumber)
+	bt, anchorKnown := s.blockTimeOf(ctx, r.BlockNumber)
+	started := time.Now().UnixMilli()
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		rec := &Record{T: bt * 1000, User: u.id, Profile: u.p.Name, Action: "withdraw-payout", Kind: "payout",
-			Hash: r.TxHash.Hex()}
+		rec := userPayoutRecord(started, bt, anchorKnown)
+		rec.User, rec.Profile, rec.Action, rec.Kind, rec.Hash = u.id, u.p.Name, "withdraw-payout", "payout", r.TxHash.Hex()
 		deadline := time.Now().Add(90 * time.Minute)
 		for time.Now().Before(deadline) {
 			w, err := bridge.ReadWithdrawal(ctx, s.e.Eth, id)
 			if err == nil && w.PaidIn != (common.Hash{}) {
 				rec.OK = true
-				rec.ConfirmMS = time.Now().UnixMilli() - rec.T
+				observeUserPayoutDelay(rec, time.Now().UnixMilli())
 				s.emit(rec)
 				return
 			}
-			time.Sleep(15 * time.Second)
+			select {
+			case <-ctx.Done():
+				rec.Error = "payout observation canceled"
+				s.emit(rec)
+				return
+			case <-time.After(15 * time.Second):
+			}
 		}
 		rec.Error = "not paid within 90 minutes of the withdrawal"
 		s.emit(rec)
@@ -1118,6 +1176,8 @@ func (u *user) browse(ctx context.Context, rec *Record) {
 	}
 	wg.Wait()
 	rec.LatencyMS = time.Since(t0).Milliseconds()
+	known := true
+	rec.LatencyKnown = &known
 	rec.Bytes = bytes.Load()
 	if v := bad.Load(); v != nil {
 		rec.Error = v.(string)

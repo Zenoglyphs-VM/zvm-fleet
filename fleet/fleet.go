@@ -14,12 +14,15 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -118,8 +121,11 @@ type Env struct {
 	http     *http.Client
 	running  map[string]bool
 	state    State
-	onSample func(Sample)       // also sent each sample, when set
+	onSample func(Sample) error // also sent each sample, when set
 	owned    map[int][]*big.Int // NFT ids each seller holds, from the list phase
+	runMu    sync.Mutex         // protects phase execution and stream configuration
+	stream   *jsonlOutput
+	userRun  *userRunClaim
 }
 
 // State survives between invocations, so phases can be re-run one at a time.
@@ -157,6 +163,9 @@ func (e *Env) saveState() error {
 	if err != nil {
 		return err
 	}
+	if e.userRun != nil {
+		return e.writeUserState(raw)
+	}
 	return os.WriteFile(e.statePath(), raw, 0o644)
 }
 
@@ -177,6 +186,7 @@ type RunRef struct {
 }
 
 type PhaseRecord struct {
+	RunID     string         `json:"runId,omitempty"`
 	ID        string         `json:"id"`
 	Title     string         `json:"title"`
 	StartedAt time.Time      `json:"startedAt"`
@@ -205,24 +215,63 @@ type Phase struct {
 
 // StreamSamples appends every phase sample to <out>/samples.jsonl as it is
 // taken, for runs long enough that holding them until the phase ends is a
-// risk. Call it after Init.
-func (e *Env) StreamSamples() (func(), error) {
-	f, err := os.OpenFile(filepath.Join(e.Out, "samples.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+// risk. Call it after Init and check the returned close function's error after
+// RunPhases. Existing samples are appended, not assigned a new run identity.
+func (e *Env) StreamSamples() (func() error, error) {
+	if !e.runMu.TryLock() {
+		return nil, errors.New("cannot configure a sample stream during phase execution")
+	}
+	defer e.runMu.Unlock()
+	if e.stream != nil {
+		if closed, _ := e.stream.status(); !closed {
+			return nil, errors.New("sample stream already active")
+		}
+	}
+	var f io.WriteCloser
+	var err error
+	if e.userRun != nil {
+		f, err = e.openUserOutput("samples.jsonl")
+	} else {
+		f, err = os.OpenFile(filepath.Join(e.Out, "samples.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	}
 	if err != nil {
 		return nil, err
 	}
-	e.onSample = func(s Sample) {
-		raw, _ := json.Marshal(s)
-		f.Write(append(raw, '\n'))
+	stream := newJSONLOutput(f, nil)
+	e.stream = &stream
+	e.onSample = func(s Sample) error {
+		if id := e.userRunToken(); id != "" {
+			if s.RunID != "" && s.RunID != id {
+				stream.mu.Lock()
+				err := stream.failLocked("sample run identifier", errors.New("identifier mismatch"))
+				stream.mu.Unlock()
+				return err
+			}
+			s.RunID = id
+		}
+		return stream.append(s, true)
 	}
-	return func() { f.Close() }, nil
+	return stream.finish, nil
 }
 
 // New prepares an environment: HTTP client, running containers, the probe
 // copied into the node containers, and saved state.
 func (e *Env) Init(ctx context.Context) error {
+	if !e.runMu.TryLock() {
+		return errors.New("cannot initialize during phase execution")
+	}
+	defer e.runMu.Unlock()
+	if e.userRun != nil {
+		if err := e.checkUserRun(); err != nil {
+			return err
+		}
+	}
 	e.http = bench.PooledHTTP(60 * time.Second)
-	if err := os.MkdirAll(filepath.Join(e.Out, "runs"), 0o755); err != nil {
+	if e.userRun != nil {
+		if err := e.prepareUserOutput(); err != nil {
+			return err
+		}
+	} else if err := os.MkdirAll(filepath.Join(e.Out, "runs"), 0o755); err != nil {
 		return err
 	}
 	if e.Names.Node == "" {
@@ -238,16 +287,63 @@ func (e *Env) Init(ctx context.Context) error {
 	}
 	// Report() reads this back to render the right container names for this
 	// -out directory, without needing the flags the run started with.
-	if raw, err := json.MarshalIndent(e.Names, "", " "); err == nil {
-		os.WriteFile(filepath.Join(e.Out, "names.json"), raw, 0o644)
+	e.Names.RunID = e.userRunToken()
+	raw, err := json.MarshalIndent(e.Names, "", " ")
+	if err != nil {
+		return err
 	}
-	e.loadState()
+	if e.userRun != nil {
+		err = e.writeUserOutput("names.json", raw)
+	} else {
+		err = os.WriteFile(filepath.Join(e.Out, "names.json"), raw, 0o644)
+	}
+	if err != nil {
+		return fmt.Errorf("writing node profile: %w", err)
+	}
+	if e.userRun == nil {
+		e.loadState()
+	} else {
+		e.owned = map[int][]*big.Int{}
+	}
 	return nil
 }
 
 // RunPhases runs phases in order, each wrapped in snapshots and sampling, and
-// writes one JSON file per phase. A failed phase is recorded and the next runs.
-func (e *Env) RunPhases(ctx context.Context, phases []Phase) error {
+// writes one JSON file per phase. Ordinary workload failures retain the next
+// phase policy, but are also returned. A stream failure stops further phases.
+func (e *Env) RunPhases(ctx context.Context, phases []Phase) (result error) {
+	if !e.runMu.TryLock() {
+		return errors.New("phase execution already active")
+	}
+	defer e.runMu.Unlock()
+	if e.userRun != nil {
+		if err := e.checkUserRun(); err != nil {
+			return err
+		}
+	}
+	ids := map[string]bool{}
+	for _, ph := range phases {
+		if !filepath.IsLocal(ph.ID) || filepath.Base(ph.ID) != ph.ID || strings.ContainsAny(ph.ID, "/\\") {
+			return errors.New("phase identifier must be a local filename")
+		}
+		if e.userRun != nil {
+			if ids[ph.ID] {
+				return errors.New("duplicate phase identifier in a claimed user run")
+			}
+			ids[ph.ID] = true
+			if _, err := os.Lstat(filepath.Join(e.Out, ph.ID+".json")); !os.IsNotExist(err) {
+				return errors.New("claimed user phase output already exists or is unavailable")
+			}
+		}
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	if e.stream != nil {
+		e.stream.bindPhase(cancel)
+		defer e.stream.bindPhase(nil)
+		defer func() { result = errors.Join(result, e.stream.flush()) }()
+	}
+	var failures error
 	// The healer runs for the whole benchmark, not per phase: a gap opened in
 	// one phase stalls the next.
 	h := &healer{e: e}
@@ -257,20 +353,33 @@ func (e *Env) RunPhases(ctx context.Context, phases []Phase) error {
 		go h.run(hctx)
 	}
 	for _, ph := range phases {
-		if ctx.Err() != nil {
-			return ctx.Err()
+		if err := context.Cause(ctx); err != nil {
+			return errors.Join(failures, err)
+		}
+		if e.userRun != nil {
+			if err := e.checkUserRun(); err != nil {
+				return errors.Join(failures, err)
+			}
 		}
 		// Start from a quiet chain, as `zvm bench suite` does between steps:
 		// otherwise a phase measures what the last one left behind. Measured on
 		// chain 71 on 2026-09-17: saturation left 8,908 queued at 24x the fusion
 		// price, and the next phase would have run inside that.
-		waited, gaveUp := e.settle(ctx, 15*time.Minute)
-		rec := &PhaseRecord{ID: ph.ID, Title: ph.Title, StartedAt: time.Now().UTC(), Data: map[string]any{}}
-		if waited > time.Second {
-			rec.Data["settle"] = map[string]any{"waitedSeconds": waited.Seconds(), "gaveUp": gaveUp}
+		settled := e.settleState(ctx, 15*time.Minute)
+		if err := context.Cause(ctx); err != nil {
+			return errors.Join(failures, err)
 		}
+		rec := &PhaseRecord{ID: ph.ID, RunID: e.userRunToken(), Title: ph.Title, StartedAt: time.Now().UTC(), Data: map[string]any{"settle": settled}}
 		e.Log.Info("phase", "id", ph.ID, "title", ph.Title)
 		rec.Before = e.snapshot(ctx)
+		if err := context.Cause(ctx); err != nil {
+			return errors.Join(failures, err)
+		}
+		if e.userRun != nil {
+			if err := e.checkUserRun(); err != nil {
+				return errors.Join(failures, err)
+			}
+		}
 
 		sctx, stop := context.WithCancel(ctx)
 		var wg sync.WaitGroup
@@ -282,6 +391,10 @@ func (e *Env) RunPhases(ctx context.Context, phases []Phase) error {
 		err := ph.Run(ctx, e, rec)
 		stop()
 		wg.Wait()
+		if e.stream != nil {
+			err = errors.Join(err, e.stream.flush())
+		}
+		err = errors.Join(err, context.Cause(ctx))
 
 		rec.After = e.snapshot(ctx)
 		rec.EndedAt = time.Now().UTC()
@@ -292,23 +405,27 @@ func (e *Env) RunPhases(ctx context.Context, phases []Phase) error {
 		}
 		if err != nil {
 			rec.Error = err.Error()
+			failures = errors.Join(failures, fmt.Errorf("phase %s: %w", ph.ID, err))
 			e.Log.Error("phase failed", "id", ph.ID, "err", err)
 		}
 		if err := e.save(rec); err != nil {
-			return err
+			return errors.Join(failures, err)
 		}
 		if err := e.saveState(); err != nil {
-			return err
+			return errors.Join(failures, err)
 		}
 		e.Log.Info("phase done", "id", ph.ID, "took", rec.EndedAt.Sub(rec.StartedAt).Round(time.Second))
 	}
-	return nil
+	return failures
 }
 
 func (e *Env) save(rec *PhaseRecord) error {
 	raw, err := json.MarshalIndent(rec, "", " ")
 	if err != nil {
 		return err
+	}
+	if e.userRun != nil {
+		return e.writeUserOutput(rec.ID+".json", append(raw, '\n'))
 	}
 	return os.WriteFile(filepath.Join(e.Out, rec.ID+".json"), append(raw, '\n'), 0o644)
 }
@@ -379,62 +496,4 @@ func indexOf(s, sub string) int {
 		}
 	}
 	return -1
-}
-
-// settlePrice is "close enough to base to start a phase", in go-zenon's
-// thousandths: 1.2x, the same threshold `zvm bench suite` uses.
-const settlePrice = 1_200
-
-// settle waits until the relayer holds nothing and, under dynamic plasma, the
-// fusion price is back near its base — or max passes, which it reports.
-func (e *Env) settle(ctx context.Context, max time.Duration) (time.Duration, bool) {
-	start := time.Now()
-	for {
-		var info struct {
-			Relayer struct {
-				Queued        int `json:"queued"`
-				PostedPending int `json:"postedPending"`
-			} `json:"relayer"`
-		}
-		busy := false
-		if e.getJSON(ctx, "/api/info", &info) == nil {
-			busy = info.Relayer.Queued > 0 || info.Relayer.PostedPending > 0
-		}
-		var price uint64
-		hot := false
-		if m, err := e.L1.FrontierMomentum(ctx); err == nil {
-			price = m.FusionPrice()
-			// The L2's own fee market too: a phase's wallets sign with a cap
-			// sized from the base fee they start at, so starting at 5x the
-			// floor — where phase 01's 16.75 M-gas funding calls left chain 70
-			// — makes every call reserve 5x what it will pay, and wallets that
-			// could afford the transfer cannot afford the reservation.
-			if h, err := e.Eth.HeaderByNumber(ctx, nil); err == nil && h.BaseFee != nil {
-				floor := new(big.Int).SetUint64(e.Rollup.MinBaseFeeAt(m.Height))
-				limit := new(big.Int).Div(new(big.Int).Mul(floor, big.NewInt(settlePrice)), big.NewInt(1000))
-				hot = floor.Sign() > 0 && h.BaseFee.Cmp(limit) > 0
-			}
-		}
-		if !busy && !hot && price <= settlePrice {
-			return time.Since(start), false
-		}
-		// A backlog is worth the long wait; a price a little above the
-		// threshold with nothing queued is not — chain 71 sat at 1.275x for
-		// fifteen minutes with an empty relayer. Give the price what
-		// `zvm bench suite` gives it.
-		if !busy && time.Since(start) > 3*time.Minute {
-			e.Log.Warn("starting the phase before prices settled", "fusionPrice", float64(price)/1000, "baseFeeHigh", hot)
-			return time.Since(start), true
-		}
-		if time.Since(start) > max {
-			e.Log.Warn("chain did not settle before the phase", "queued", info.Relayer.Queued,
-				"posted", info.Relayer.PostedPending, "fusionPrice", float64(price)/1000, "baseFeeHigh", hot)
-			return time.Since(start), true
-		}
-		select {
-		case <-ctx.Done():
-			return time.Since(start), true
-		case <-time.After(5 * time.Second):
-		}
-	}
 }

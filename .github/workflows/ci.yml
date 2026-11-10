@@ -11,6 +11,7 @@ permissions:
 jobs:
   go:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,4 +23,121 @@ jobs:
 
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -json -count=1 ./...
+
+      - name: Cache declared static probe dependency
+        timeout-minutes: 1
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GOVCS: "*:off"
+          GONOPROXY: none
+          GONOSUMDB: none
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: |
+          go mod download github.com/decred/dcrd/dcrec/secp256k1/v4@v4.0.1
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build owned Docker probe fixtures
+        timeout-minutes: 4
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: |
+          test "$(git rev-parse HEAD:zvm-node)" = ae90b945b0ea95887c31cfb2f19e0b88504186d8
+          test "$(git -C zvm-node rev-parse HEAD)" = ae90b945b0ea95887c31cfb2f19e0b88504186d8
+          fleet_probe_fixture="$RUNNER_TEMP/fleet-probe-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$fleet_probe_fixture"
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$fleet_probe_fixture/zvm-probe" github.com/Zenoglyphs-VM/zvm-node/cmd/zvm-node
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$fleet_probe_fixture/helper" ./testdata/probe-fixture
+          chmod 0644 "$fleet_probe_fixture/zvm-probe"
+          chmod 0755 "$fleet_probe_fixture/helper"
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Run owned Docker SQLite probe
+        timeout-minutes: 4
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+          FLEET_OWNED_DOCKER: "1"
+        run: go test -json -count=1 -timeout=3m -tags=fleetdocker ./fleet -run '^TestProbeOwnedDockerSQLite$'
+
+      - name: Fuzz exact measurement counters
+        timeout-minutes: 3
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -count=1 ./internal/measurement -run '^$' -fuzz '^FuzzMeasurementCounter$' -fuzztime=5s -parallel=1
+
+      # Compile instrumentation outside each campaign's wall-clock budget.
+      # Go's build cache is reused; no test binary is exported or uploaded.
+      - name: Build Fleet fuzz instrumentation
+        timeout-minutes: 6
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -c -o /dev/null ./fleet -fuzz '^FuzzUserTimingExactStatistics$'
+
+      - name: Fuzz exact user timing statistics
+        timeout-minutes: 3
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -count=1 ./fleet -run '^$' -fuzz '^FuzzUserTimingExactStatistics$' -fuzztime=5s -parallel=1
+
+      - name: Fuzz user timing wire and cohorts
+        timeout-minutes: 3
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -count=1 ./fleet -run '^$' -fuzz '^FuzzUserTimingWireCohorts$' -fuzztime=5s -parallel=1
+
+      - name: Fuzz checked user clock arithmetic
+        timeout-minutes: 3
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -count=1 ./fleet -run '^$' -fuzz '^FuzzUserTimingClockArithmetic$' -fuzztime=5s -parallel=1
+
+      - name: Run Fleet measurement race tests
+        timeout-minutes: 6
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -race -count=1 ./fleet ./internal/measurement
+
+      - name: Run user report publication race tests
+        timeout-minutes: 3
+        env:
+          GOTOOLCHAIN: local
+          GOPROXY: "off"
+          GOSUMDB: "off"
+          GOMAXPROCS: "2"
+          GOFLAGS: "-mod=readonly -p=1"
+        run: go test -race -count=1 ./cmd/zvm-fleet

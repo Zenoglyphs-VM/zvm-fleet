@@ -6,8 +6,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -93,6 +95,9 @@ func benchUsers(args []string) error {
 		Dex: dex, Apps: appsDep, Arts: arts, Out: *out, Probe: *probe, Repo: ".", Opts: fleet.DefaultOptions(),
 		Names: names, Heal: *heal, SampleEvery: *sample, Log: slog.Default().With("svc", "users"),
 	}
+	if err := f.StartUserRun(); err != nil {
+		return err
+	}
 	if *follower != "" {
 		if f.Follower, err = bench.DialPooled(context.Background(), *follower); err != nil {
 			return err
@@ -115,14 +120,19 @@ func benchUsers(args []string) error {
 	runErr := f.RunPhases(ctx, []fleet.Phase{phase})
 	// The report is written even when the run was cut short: it is rebuilt from
 	// the records streamed so far.
-	if err := writeUsersReport(*out, filepath.Join(*out, "USERS.md")); err != nil {
-		fmt.Fprintln(os.Stderr, "report:", err)
-	}
-	if runErr != nil {
-		return runErr
+	if err := finishUsersRun(runErr, closeSamples, *out, filepath.Join(*out, "USERS.md")); err != nil {
+		return err
 	}
 	fmt.Printf("users ran %s → %s\n", time.Since(start).Round(time.Second), filepath.Join(*out, "USERS.md"))
 	return nil
+}
+
+// Close sampling before replay. A partial report can still be useful after a
+// failed run, but must not turn a run, stream or report error into success.
+func finishUsersRun(runErr error, closeSamples func() error, in, out string) error {
+	streamErr := closeSamples()
+	reportErr := writeUsersReport(in, out)
+	return errors.Join(runErr, streamErr, reportErr)
 }
 
 // scaleMix keeps the mix's proportions at n users, handing the rounding
@@ -162,27 +172,53 @@ func writeUsersReport(in, out string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(out, []byte(fleet.UsersMarkdown(s)), 0o644); err != nil {
-		return err
-	}
 	raw, err := json.MarshalIndent(s, "", " ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(in, "summary.json"), raw, 0o644)
+	return publishUsersReport(in, out, []byte(fleet.UsersMarkdown(s)), raw)
 }
 
 func benchUsersReport(args []string) error {
+	return benchUsersReportTo(args, os.Stdout)
+}
+
+func benchUsersReportTo(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("users-report", flag.ExitOnError)
 	in := fs.String("in", "bench/users-baseline", "directory of a user simulation")
 	out := fs.String("out", "", "markdown to write (default: <in>/USERS.md)")
+	verify := fs.Bool("verify", false, "verify the stored report pair and its receipt without rebuilding it")
+	read := fs.String("read", "", "emit the exact checked stored markdown or summary bytes without rebuilding")
 	fs.Parse(args)
 	if *out == "" {
 		*out = filepath.Join(*in, "USERS.md")
 	}
+	readSelected := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "read" {
+			readSelected = true
+		}
+	})
+	if readSelected {
+		if (*read != "markdown" && *read != "summary") || fs.NArg() != 0 {
+			return errors.New("-read must select markdown or summary without positional arguments")
+		}
+		report, err := readUsersReport(*in, *out, *read)
+		if err != nil {
+			return err
+		}
+		return report.write(stdout, *read)
+	}
+	if *verify {
+		if err := verifyUsersReport(*in, *out); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintln(stdout, "verified stored report pair", *out)
+		return err
+	}
 	if err := writeUsersReport(*in, *out); err != nil {
 		return err
 	}
-	fmt.Println("wrote", *out)
-	return nil
+	_, err := fmt.Fprintln(stdout, "wrote", *out)
+	return err
 }
